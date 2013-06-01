@@ -184,58 +184,29 @@ void PO_Blur::engine ( int y, int l, int r, ChannelMask channels, Row& row )
     if ( _firstTime ) {
       cout << "First time " << endl;
       
-      // the nuke stuff
+      ////////////////////////////////////////
+      // the nuke stuff 
       Format format = input0().format();
-
       // these useful format variables are used later
       const int fx = format.x();
       const int fy = format.y();
       const int fr = format.r();
       const int ft = format.t();
-
-      const int height = ft - fy ;
-      const int width = fr - fx ;
-
-      //the framebuffer we save the input in
-      _img_in = new CImg<float>(width, height, 1, 3, 0);
-
       ChannelSet readChannels = input0().info().channels();
-
       Interest interest( input0(), fx, fy, fr, ft, readChannels, true );
       interest.unlock();
 
+      ////////////////////////////////////////
+      // the PO stuff
+      const int height = ft - fy ;
+      const int width = fr - fx ;
 
-      // fetch each row
-      for ( int ry = fy; ry < ft; ry++) {
-        progressFraction( ry, ft - fy );
-        Row row( fx, fr );
-        row.get( input0(), ry, fx, fr, readChannels );
-        if ( aborted() )
-          return;
-
-        foreach( z, channels )  {
-          //first channel is black so substract one
-          int chanNo = z - 1;
-          if (chanNo < 3) {
-             // cout << "Reading Channel " << z << endl;
-             const float* in = row[z];
-             for (int x = fx ; x < fr ; x++)
-             {
-                 _img_in->atXY(x,ry,0,chanNo) = in[x];
-             }
-          }
-        }      
-        
-      }
-    
-      
       // sone predefined constants for now
       const int degree = 3;
       const int filter_size = 1;
       _sensor_width = 36;
       const float lambda_from = 440;
-      const float lambda_to = 660;
-      
+      const float lambda_to = 660;      
 
       //the output is stored here
       //first delete the old image
@@ -244,7 +215,6 @@ void PO_Blur::engine ( int y, int l, int r, ChannelMask channels, Row& row )
        
       // Focus on 550nm
       System44f lens = get_system(550, obj_distance, degree);
-
       System44f tempsystem = get_system(550, focus_point, degree);
 
       // Determine back focal length from degree-1 terms (matrix optics)
@@ -259,26 +229,117 @@ void PO_Blur::engine ( int y, int l, int r, ChannelMask channels, Row& row )
 
       // Add the depth to the filmgate propagation
       Transform4f prop = propagate_5(d3, degree);
-      lens = lens >> prop;
-    
+      lens = lens >> prop;    
 
-      // trace the image, returns false if aborted
-      if (! PO_Blur::traceRow(&lens))
-        return;
+      //int samplesFired = 0;
+      
+      //the framebuffer we save the input in
+      _img_in = new CImg<float>(width, height, 1, 3, 0);
+
+      const float sensor_scaling = width / _sensor_width;
+
+      // fetch each row
+      for ( int ry = fy; ry < ft; ry++) {
+        const int j = ry-fy;
+
+        ////////////////////////////////////////
+        // the nuke stuff 
+        progressFraction( ry, ft - fy );
+        Row row( fx, fr );
+        row.get( input0(), ry, fx, fr, readChannels );
+        if ( aborted() )
+          return;
+
+        ChannelSet done;
+        foreach( z, channels )  {
+          // skip if we did it as a side-effect of another channel or this is not an rgb channel
+          if ( (done & z) || (z>3) || (z<1)    )      
+            continue;             
+          // Find the rgb channels that belongs to the set this channel is in.
+          // Add them all to "done" so we don't run them a second time:
+          Channel rchan = brother(z, 0);
+          done += rchan;
+          Channel gchan = brother(z, 1);
+          done += gchan;
+          Channel bchan = brother(z, 2);
+          done += bchan;
+
+          const float* rIn = row[rchan];
+          const float* gIn = row[gchan];
+          const float* bIn = row[bchan];
+       
+          ////////////////////////////////////////
+          // the PO stuff
+          const float y_sensor = ((j - height/2)/(float)width) * _sensor_width;
+          const float y_world = y_sensor / _magnification;
+          
+#pragma omp parallel for
+        // loop through x
+          for (int x = fx ; x < fr ; x++)
+          {
+            const int i = x - fx;
+
+            const float x_sensor = (i / (float)width - 0.5) * _sensor_width;
+            const float x_world = x_sensor / _magnification;          
+            
+            const float rgbin[3] = { rIn[x], gIn[x], bIn[x] };
+
+            // Quasi-importance sampling: 
+            // pick number of samples according to pixel intensity
+            const float impValue = pow ( ( (rgbin[0] + rgbin[1] + rgbin[2])/ 3), 0.45f);
+            const int num_samples = max(1, (int)(impValue * sample_mul));
+            const float sample_weight = 1.0f / num_samples;
+
+
+            // With that, we can now start sampling the aperture:
+            for (int sample = 0; sample < num_samples; ++sample) {
+              // Rejection-sample points from lens aperture:
+              float x_ap, y_ap;
+              do {
+                x_ap = (rand() / (float)RAND_MAX - 0.5) * 2 * aperture;
+                y_ap = (rand() / (float)RAND_MAX - 0.5) * 2 * aperture;
+              } while (x_ap * x_ap + y_ap * y_ap > aperture * aperture);
+            
+              float in[5], out[4];
+
+              // Fill in variables and evaluate systems:
+              in[0] = x_world;// + _pixel_size * (rand()/(float)RAND_MAX - 0.5);
+              in[1] = y_world;
+              in[2] = x_ap;
+              in[3] = y_ap;
+
+              lens.evaluate(in,out); 
+              //samplesFired++;
+              // Scale to pixel size:
+              out[0] = out[0] * sensor_scaling + width/2;
+              out[1] = out[1] * sensor_scaling + height/2;
+
+              // out[2] contains one minus square of Lambertian cosine
+              float lambert = sqrt(1 - out[2]);
+              if (lambert != lambert) lambert = 0; // NaN check
+
+              _img_out->set_linear_atXY(lambert * sample_weight * rgbin[0], out[0],out[1],0,0, true);
+              _img_out->set_linear_atXY(lambert * sample_weight * rgbin[1], out[0],out[1],0,1, true);
+              _img_out->set_linear_atXY(lambert * sample_weight * rgbin[2], out[0],out[1],0,2, true);
+
+            }// sample loop            
+          }// column x loop          
+        }//channel loop       
+      }// rowloop
+
 
       _firstTime = false;
-      cout << " done " << endl;
+      //cout << " done " << samplesFired << endl;
 
-      //destroy image in
-      delete _img_in;
-    }
+    } // end first time
   } // end lock
 
+  // write the output
   Row in( l,r);
   in.get( input0(), y, l, r, channels );
   if ( aborted() )
     return;
-  //cout << " r " << img_out->atXY(0,y,0,0) << " g " << img_out->atXY(0,y,0,1) << " b " << img_out->atXY(0,y,0,2) << endl;
+
   foreach( z, channels ) {
     float *CUR = row.writable(z) + l;
     const float* inptr = in[z] + l;
@@ -288,14 +349,13 @@ void PO_Blur::engine ( int y, int l, int r, ChannelMask channels, Row& row )
       int chanNo = z - 1;
       if (chanNo < 3) { 
         *CUR++ = _img_out->atXY(x++,y,0,chanNo);
-        // *CUR++ = 1.0f;
       }
       else
       {
         *CUR++ = *inptr++ ;
       }
     }
-  }
+  } // end loop channel
 
   //cout << "Done Writing " << endl;
 }
@@ -336,80 +396,3 @@ System44f PO_Blur::get_system(float lambda, float d0, int degree) {
     >> refract_spherical_5(R3,glass2.get_index(lambda), 1.f, degree);
 }
 
-
-bool PO_Blur::traceRow(System44f *lens) {
-
-      const int width = _img_out->width();
-      const int height = _img_out->height();
-      const float sensor_scaling = width / _sensor_width;
-
-      
-        for (int j = 0; j < height; j++) {
-          if ( aborted() )
-          {
-             _lock.unlock();
-            return false;
-          }
-          if (!(j%10)) cout << "." << flush;
-
-          const float y_sensor = ((j - height/2)/(float)width) * _sensor_width;
-          const float y_world = y_sensor / _magnification;
-
-          // Bake y dependency
-          // System34f system_y = lens->bake_input_variable(1, y_world);
-#pragma omp parallel for
-          for (int i = 0; i < width; i++) { 
-            const float x_sensor = (i / (float)width - 0.5) * _sensor_width;
-            const float x_world = x_sensor / _magnification;
-          
-            // Sample intensity at wavelength lambda from source image
-            const float rgbin[3] = {
-              _img_in->linear_atXY(i, j, 0, 0, 0),
-              _img_in->linear_atXY(i, j, 0, 1, 0),
-              _img_in->linear_atXY(i, j, 0, 2, 0)};
-            // float L_in = spectrum_rgb_to_p(lambda, rgbin);
-
-            // Quasi-importance sampling: 
-            // pick number of samples according to pixel intensity
-            //int num_samples = max(1,(int)(pow(rgbin[0],0.45f) * sample_mul));
-            //float sample_weight = (pow(rgbin[0],0.45f)) / num_samples;
-            int num_samples = sample_mul;
-            float sample_weight = 1.0f/(float)num_samples;
-
-
-            // With that, we can now start sampling the aperture:
-            for (int sample = 0; sample < num_samples; ++sample) {
-              // Rejection-sample points from lens aperture:
-              float x_ap, y_ap;
-              do {
-                x_ap = (rand() / (float)RAND_MAX - 0.5) * 2 * aperture;
-                y_ap = (rand() / (float)RAND_MAX - 0.5) * 2 * aperture;
-              } while (x_ap * x_ap + y_ap * y_ap > aperture * aperture);
-            
-              float in[5], out[4];
-
-              // Fill in variables and evaluate systems:
-              in[0] = x_world;// + _pixel_size * (rand()/(float)RAND_MAX - 0.5);
-              in[1] = y_world;
-              in[2] = x_ap;
-              in[3] = y_ap;
-
-              lens->evaluate(in,out); 
-
-              // Scale to pixel size:
-              out[0] = out[0] * sensor_scaling + width/2;
-              out[1] = out[1] * sensor_scaling + height/2;
-
-              // out[2] contains one minus square of Lambertian cosine
-              float lambert = sqrt(1 - out[2]);
-              if (lambert != lambert) lambert = 0; // NaN check
-
-              _img_out->set_linear_atXY(lambert * sample_weight * rgbin[0], out[0],out[1],0,0, true);
-              _img_out->set_linear_atXY(lambert * sample_weight * rgbin[1], out[0],out[1],0,1, true);
-              _img_out->set_linear_atXY(lambert * sample_weight * rgbin[2], out[0],out[1],0,2, true);
-
-            }
-          }
-      }
-      return true;
-}
