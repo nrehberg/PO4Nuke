@@ -62,12 +62,14 @@ using namespace std;
 class PO_Blur : public Iop
 {
   // These are the locations the user interface will store into:
-  double sample_mul;
-  int num_lambdas;
-  double focus_point;
-  double obj_distance;
-  double aperture;
-
+  double _knob_sample_mul;
+  bool _knob_fixed_samples;
+  int _knob_num_lambdas;
+  double _knob_focus_point;
+  double _knob_obj_distance;
+  double _knob_aperture;
+  bool _knob_useDepthChannel;
+  bool _knob_useApertureMask;
 
   bool _firstTime; 
   Lock _lock;
@@ -86,6 +88,7 @@ public:
   void engine(int y, int x, int r, ChannelMask, Row &);
 
   virtual void knobs(Knob_Callback);
+  virtual int knob_changed(Knob*);
 
   const char* Class() const { return CLASS; }
   const char* node_help() const { return HELP; } 
@@ -103,11 +106,14 @@ private:
 // values:
 PO_Blur::PO_Blur(Node* node) : Iop(node)
 {
-  sample_mul = 100.0f;
-  num_lambdas = 1;
-  focus_point = 5000;
-  obj_distance = 5000;  
-  aperture = 5.6f;
+  _knob_sample_mul = 100.0f; 
+  _knob_fixed_samples = false;
+  _knob_num_lambdas = 1;
+  _knob_focus_point = 5000;
+  _knob_obj_distance = 5000;  
+  _knob_aperture = 5.6f;
+  _knob_useDepthChannel = false;
+  _knob_useApertureMask = false;
 
   _firstTime = true;
   _img_in = NULL;
@@ -120,12 +126,41 @@ PO_Blur::PO_Blur(Node* node) : Iop(node)
 void PO_Blur::knobs(Knob_Callback f)
 {
   // WH_knob(f, &width, "size");
-  Int_knob(f, &num_lambdas, "Lambdas");
-  Float_knob(f, &sample_mul, "Samples");
+  Int_knob(f, &_knob_num_lambdas, "lambdas", "Lambdas");
+  Float_knob(f, &_knob_sample_mul, "samples", "Samples"); 
+  SetRange(f, 10, 5000);
+  Tooltip(f, "Number of samples to shoot for an input pixel of value 1.");
+  Newline(f);
+  Bool_knob(f,&_knob_fixed_samples, "fixed_samplesequence", "Fixed Samplesequence"); 
+  Tooltip(f, "If enabled uses a fixed samplesequence for all pixel.\nWill result in less noise but may introduce visible sampling patterns.");
+  Divider(f);
 
-  Float_knob(f, &focus_point, "Focus Point");
-  Float_knob(f, &obj_distance, "Object Distance");
-  Float_knob(f, &aperture, "Aperture");
+  Float_knob(f, &_knob_focus_point, "focuspoint", "Focuspoint");
+  SetRange(f, 1, 5000);
+  Float_knob(f, &_knob_obj_distance, "objectdistance", "Objectdistance");
+  Bool_knob(f,&_knob_useDepthChannel, "use_depth_channel", "Use Depth Channel"); 
+  Newline(f);
+  Float_knob(f, &_knob_aperture, "aperture", "Aperture");
+  SetRange(f, 1, 22);
+  Bool_knob(f,&_knob_useApertureMask, "use_aperture_mask", "Use Aperture Mask"); 
+  Newline(f);
+}
+
+// Called whenever a knob is changed
+int PO_Blur::knob_changed(Knob* k)
+{
+  //called when the properties tab is drawn for the fist time
+  if(k == &Knob::showPanel) {
+     knob("objectdistance")->enable(1 - _knob_useDepthChannel);
+     return 1;
+  }
+
+  if(k->is("use_depth_channel")) {
+     knob("objectdistance")->enable(1 - _knob_useDepthChannel);
+     return 1;
+  }
+  // call parent class
+  return Iop::knob_changed(k);
 }
 
 // This is a function that creates an instance of the operator, and is
@@ -214,8 +249,8 @@ void PO_Blur::engine ( int y, int l, int r, ChannelMask channels, Row& row )
       _img_out = new CImg<float>(width, height, 1, 3, 0);
        
       // Focus on 550nm
-      System44f lens = get_system(550, obj_distance, degree);
-      System44f tempsystem = get_system(550, focus_point, degree);
+      System44f lens = get_system(550, _knob_obj_distance, degree);
+      System44f tempsystem = get_system(550, _knob_focus_point, degree);
 
       // Determine back focal length from degree-1 terms (matrix optics)
       float d3 = find_focus_X(tempsystem);
@@ -237,6 +272,19 @@ void PO_Blur::engine ( int y, int l, int r, ChannelMask channels, Row& row )
       _img_in = new CImg<float>(width, height, 1, 3, 0);
 
       const float sensor_scaling = width / _sensor_width;
+
+
+      //generate a sample sequence
+      // float* x_ap = new float[_knob_sample_mul * 3];
+      // float* y_ap = new float[_knob_sample_mul * 3];
+      // for (int sample = 0; sample < _knob_sample_mul * 3; ++sample) {
+      //   // Rejection-sample points from lens _knob_aperture:
+      //   // float x_ap, y_ap;
+      //   do {
+      //     x_ap[sample] = (rand() / (float)RAND_MAX - 0.5) * 2 * _knob_aperture;
+      //     y_ap[sample] = (rand() / (float)RAND_MAX - 0.5) * 2 * _knob_aperture;
+      //   } while (x_ap[sample] * x_ap[sample] + y_ap[sample] * y_ap[sample] > _knob_aperture * _knob_aperture);
+      // }
 
       // fetch each row
       for ( int ry = fy; ry < ft; ry++) {
@@ -285,20 +333,20 @@ void PO_Blur::engine ( int y, int l, int r, ChannelMask channels, Row& row )
             const float rgbin[3] = { rIn[x], gIn[x], bIn[x] };
 
             // Quasi-importance sampling: 
-            // pick number of samples according to pixel intensity
-            const float impValue = pow ( ( (rgbin[0] + rgbin[1] + rgbin[2])/ 3), 0.45f);
-            const int num_samples = max(1, (int)(impValue * sample_mul));
+            // pick number of samples according to pixel intensity, gamma corrected, different weights for rgb amd max 3
+            const float impValue =  min(3.0f, pow ( ( (rgbin[0] * 2 + rgbin[1] * 3 + rgbin[2])/ 6), 0.45f) );
+            const int num_samples = max(1, (int)(impValue * _knob_sample_mul));
             const float sample_weight = 1.0f / num_samples;
 
 
-            // With that, we can now start sampling the aperture:
+            // With that, we can now start sampling the _knob_aperture:
             for (int sample = 0; sample < num_samples; ++sample) {
-              // Rejection-sample points from lens aperture:
+              // Rejection-sample points from lens _knob_aperture:
               float x_ap, y_ap;
               do {
-                x_ap = (rand() / (float)RAND_MAX - 0.5) * 2 * aperture;
-                y_ap = (rand() / (float)RAND_MAX - 0.5) * 2 * aperture;
-              } while (x_ap * x_ap + y_ap * y_ap > aperture * aperture);
+                x_ap = (rand() / (float)RAND_MAX - 0.5) * 2 * _knob_aperture;
+                y_ap = (rand() / (float)RAND_MAX - 0.5) * 2 * _knob_aperture;
+              } while (x_ap * x_ap + y_ap * y_ap > _knob_aperture * _knob_aperture);
             
               float in[5], out[4];
 
@@ -366,7 +414,7 @@ void PO_Blur::engine ( int y, int l, int r, ChannelMask channels, Row& row )
 
 System44f PO_Blur::get_system(float lambda, float d0, int degree) {
  // Let's simulate Edmund Optics achromat #NT32-921:
-  /* Clear Aperture CA (mm)   39.00
+  /* Clear _knob_aperture CA (mm)   39.00
      Eff. Focal Length EFL (mm)   120.00
      Back Focal Length BFL (mm)   111.00
      Center Thickness CT 1 (mm)   9.60
