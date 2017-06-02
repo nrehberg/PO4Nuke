@@ -48,6 +48,7 @@ using namespace cimg_library;
 #include <iostream>
 #include <stdlib.h>
 #include <math.h>
+#include <ctime>
 using namespace std;
 
 // Disable some warnings on Microsoft VC++ compilers.
@@ -75,9 +76,7 @@ class PO_Blur : public Iop
   Lock _lock;
   CImg <float> * _img_out;
   CImg <float> * _img_in;
-  float _magnification;
   float _sensor_width;
-  float _pixel_size;
 
 public: 
   // You must implement these functions:
@@ -98,7 +97,9 @@ public:
   //~PO_Blur();
 
 private:
+  System44f get_system(float,  int = 3);
   System44f get_system(float, float,  int = 3);
+  void generateSampleSequence(int , float* , float* );
   bool traceRow(System44f*);
 };
 
@@ -213,12 +214,16 @@ void PO_Blur::_request(int x, int y, int r, int t, ChannelMask channels, int cou
 // by asking the input for data, and modifying it:
 void PO_Blur::engine ( int y, int l, int r, ChannelMask channels, Row& row )
 {
-  //cout << "Line " << y << endl;
+
   {
     Guard guard(_lock);
     if ( _firstTime ) {
-      cout << "First time " << endl;
-      
+      cout << "PO::Blur> Begin tracing lens " << endl;
+      //for measuring the tracing time
+      clock_t start;
+      start = clock();
+
+
       ////////////////////////////////////////
       // the nuke stuff 
       Format format = input0().format();
@@ -249,42 +254,48 @@ void PO_Blur::engine ( int y, int l, int r, ChannelMask channels, Row& row )
       _img_out = new CImg<float>(width, height, 1, 3, 0);
        
       // Focus on 550nm
-      System44f lens = get_system(550, _knob_obj_distance, degree);
-      System44f tempsystem = get_system(550, _knob_focus_point, degree);
+      System44f lens = get_system(550, degree);
+      System44f focal_system = two_plane_5(_knob_focus_point, degree) >> lens;
 
       // Determine back focal length from degree-1 terms (matrix optics)
-      float d3 = find_focus_X(tempsystem);
-      cout << "Focus: " << d3 << endl;
-      // Compute magnification and output equation system
-      _magnification = get_magnification_X(lens >> propagate_5(d3));
-      
-      // Support of an input image pixel in world plane
-      _pixel_size = _sensor_width/(float)width/_magnification;
-      cout << "Magnification: " << _magnification << endl;
+      float d3 = find_focus_X(focal_system);
+      cout << "PO::Blur> Back focal length: " << d3 << endl;
 
       // Add the depth to the filmgate propagation
       Transform4f prop = propagate_5(d3, degree);
-      lens = lens >> prop;    
+      //lens = lens >> prop;    
 
-      //int samplesFired = 0;
       
       //the framebuffer we save the input in
       _img_in = new CImg<float>(width, height, 1, 3, 0);
 
       const float sensor_scaling = width / _sensor_width;
 
+      //we will store the samples in these arrays
+      const float maxNumSamples = _knob_sample_mul * 3;
+      float* x_ap = new float[maxNumSamples];
+      float* y_ap = new float[maxNumSamples];
+      //if fixed samles is set we generate the samplesequence here once and use it for all pixels
+      if (_knob_fixed_samples) 
+              PO_Blur::generateSampleSequence(maxNumSamples, x_ap, y_ap);
 
-      //generate a sample sequence
-      // float* x_ap = new float[_knob_sample_mul * 3];
-      // float* y_ap = new float[_knob_sample_mul * 3];
-      // for (int sample = 0; sample < _knob_sample_mul * 3; ++sample) {
-      //   // Rejection-sample points from lens _knob_aperture:
-      //   // float x_ap, y_ap;
-      //   do {
-      //     x_ap[sample] = (rand() / (float)RAND_MAX - 0.5) * 2 * _knob_aperture;
-      //     y_ap[sample] = (rand() / (float)RAND_MAX - 0.5) * 2 * _knob_aperture;
-      //   } while (x_ap[sample] * x_ap[sample] + y_ap[sample] * y_ap[sample] > _knob_aperture * _knob_aperture);
-      // }
+      float magnification;
+      //float pixel_size;
+
+      if (!_knob_useDepthChannel)
+      // we have a static focus distance, so precompute the lens system here
+      {
+        lens = two_plane_5(_knob_obj_distance, degree) >> lens >> prop;
+        // Compute magnification and output equation system
+        magnification = get_magnification_X(lens);      
+        // Support of an input image pixel in world plane
+        // pixel_size = _sensor_width/(float)width/magnification;
+        cout << "PO::Blur> Magnification: " << magnification << endl;
+        
+      }
+      else
+        lens = lens >> prop;
+      
 
       // fetch each row
       for ( int ry = fy; ry < ft; ry++) {
@@ -315,11 +326,19 @@ void PO_Blur::engine ( int y, int l, int r, ChannelMask channels, Row& row )
           const float* rIn = row[rchan];
           const float* gIn = row[gchan];
           const float* bIn = row[bchan];
-       
+
+          // get the depth channel if needed
+          Channel zchan = Chan_Black;         
+          if (_knob_useDepthChannel){            
+            foreach( z, readChannels ) {            
+            if (z == Chan_Z)
+              zchan = z;
+            }                
+          }
+          const float* zIn = row[zchan];
           ////////////////////////////////////////
           // the PO stuff
           const float y_sensor = ((j - height/2)/(float)width) * _sensor_width;
-          const float y_world = y_sensor / _magnification;
           
 #pragma omp parallel for
         // loop through x
@@ -327,9 +346,24 @@ void PO_Blur::engine ( int y, int l, int r, ChannelMask channels, Row& row )
           {
             const int i = x - fx;
 
+            System44f PixelSystem;
+            float pixel_mag;
+            //if depth is not fixed calculate lens system per pixel here
+            //get depth, it should be in the format 1/distance
+            if (_knob_useDepthChannel){
+              PixelSystem = two_plane_5(1.0f/ (zIn[x] + 0.000001f), degree) >> lens; 
+              pixel_mag = get_magnification_X(PixelSystem);   
+            }
+            else
+            {
+              PixelSystem = lens;
+              pixel_mag = magnification;
+            }
+
             const float x_sensor = (i / (float)width - 0.5) * _sensor_width;
-            const float x_world = x_sensor / _magnification;          
-            
+            const float x_world = x_sensor / pixel_mag;          
+            const float y_world = y_sensor / pixel_mag;
+
             const float rgbin[3] = { rIn[x], gIn[x], bIn[x] };
 
             // Quasi-importance sampling: 
@@ -337,26 +371,23 @@ void PO_Blur::engine ( int y, int l, int r, ChannelMask channels, Row& row )
             const float impValue =  min(3.0f, pow ( ( (rgbin[0] * 2 + rgbin[1] * 3 + rgbin[2])/ 6), 0.45f) );
             const int num_samples = max(1, (int)(impValue * _knob_sample_mul));
             const float sample_weight = 1.0f / num_samples;
+            // if fixed_samples is false generate new sample sequence for every pixel
+            if (!_knob_fixed_samples)
+              PO_Blur::generateSampleSequence(num_samples, x_ap, y_ap);
+
 
 
             // With that, we can now start sampling the _knob_aperture:
-            for (int sample = 0; sample < num_samples; ++sample) {
-              // Rejection-sample points from lens _knob_aperture:
-              float x_ap, y_ap;
-              do {
-                x_ap = (rand() / (float)RAND_MAX - 0.5) * 2 * _knob_aperture;
-                y_ap = (rand() / (float)RAND_MAX - 0.5) * 2 * _knob_aperture;
-              } while (x_ap * x_ap + y_ap * y_ap > _knob_aperture * _knob_aperture);
-            
+            for (int sample = 0; sample < num_samples; ++sample) {              
               float in[5], out[4];
 
               // Fill in variables and evaluate systems:
               in[0] = x_world;// + _pixel_size * (rand()/(float)RAND_MAX - 0.5);
               in[1] = y_world;
-              in[2] = x_ap;
-              in[3] = y_ap;
+              in[2] = x_ap[sample];
+              in[3] = y_ap[sample];
 
-              lens.evaluate(in,out); 
+              PixelSystem.evaluate(in,out); 
               //samplesFired++;
               // Scale to pixel size:
               out[0] = out[0] * sensor_scaling + width/2;
@@ -377,7 +408,8 @@ void PO_Blur::engine ( int y, int l, int r, ChannelMask channels, Row& row )
 
 
       _firstTime = false;
-      //cout << " done " << samplesFired << endl;
+      const double diff = ( clock() - start ) / (double)CLOCKS_PER_SEC;
+      cout <<"PO::Blur> Done Tracing in  " << diff << " seconds." << endl;
 
     } // end first time
   } // end lock
@@ -410,7 +442,39 @@ void PO_Blur::engine ( int y, int l, int r, ChannelMask channels, Row& row )
 
 
 ////////////////////////////
-//The PO Code
+//Some helper classes
+
+System44f PO_Blur::get_system(float lambda, int degree) {
+ // Let's simulate Edmund Optics achromat #NT32-921:
+  /* Clear _knob_aperture CA (mm)   39.00
+     Eff. Focal Length EFL (mm)   120.00
+     Back Focal Length BFL (mm)   111.00
+     Center Thickness CT 1 (mm)   9.60
+     Center Thickness CT 2 (mm)   4.20
+     Radius R1 (mm)   65.22
+     Radius R2 (mm)   -62.03
+     Radius R3 (mm)   -1240.67
+     Substrate  N-SSK8/N-SF10 
+  */
+
+  OpticalMaterial glass1("N-SSK8");
+  OpticalMaterial glass2("N-SF10");
+  
+  // Also try: const float d0 = 5000; // Scene is 5m away
+  // const float d0 = 5000000; // Scene is 5km away
+  const float R1 = 65.22;
+  const float d1 = 9.60;
+  const float R2 = -62.03; 
+  const float d2 = 4.20;
+  const float R3 = -1240.67;
+
+  //return two_plane_5(d0, degree)
+  return refract_spherical_5(R1,1.f,glass1.get_index(lambda), degree)
+    >> propagate_5(d1, degree)
+    >> refract_spherical_5(R2,glass1.get_index(lambda),glass2.get_index(lambda), degree)
+    >> propagate_5(d2, degree)
+    >> refract_spherical_5(R3,glass2.get_index(lambda), 1.f, degree);
+}
 
 System44f PO_Blur::get_system(float lambda, float d0, int degree) {
  // Let's simulate Edmund Optics achromat #NT32-921:
@@ -425,14 +489,14 @@ System44f PO_Blur::get_system(float lambda, float d0, int degree) {
      Substrate  N-SSK8/N-SF10 
   */
 
-  OpticalMaterial glass1("N-SSK8", true);
-  OpticalMaterial glass2("N-SF10", true);
+  OpticalMaterial glass1("N-SSK8");
+  OpticalMaterial glass2("N-SF10");
   
   // Also try: const float d0 = 5000; // Scene is 5m away
   // const float d0 = 5000000; // Scene is 5km away
   const float R1 = 65.22;
   const float d1 = 9.60;
-  const float R2 = -62.03;
+  const float R2 = -62.03; 
   const float d2 = 4.20;
   const float R3 = -1240.67;
 
@@ -442,5 +506,17 @@ System44f PO_Blur::get_system(float lambda, float d0, int degree) {
     >> refract_spherical_5(R2,glass1.get_index(lambda),glass2.get_index(lambda), degree)
     >> propagate_5(d2, degree)
     >> refract_spherical_5(R3,glass2.get_index(lambda), 1.f, degree);
+}
+
+void PO_Blur::generateSampleSequence(int num_samples, float * x_ap, float * y_ap){
+      //generate a sample sequence
+      for (int sample = 0; sample < num_samples; ++sample) {
+        // Rejection-sample points from lens _knob_aperture:
+        // float x_ap, y_ap;
+        do {
+          x_ap[sample] = (rand() / (float)RAND_MAX - 0.5) * 2 * _knob_aperture;
+          y_ap[sample] = (rand() / (float)RAND_MAX - 0.5) * 2 * _knob_aperture;
+        } while (x_ap[sample] * x_ap[sample] + y_ap[sample] * y_ap[sample] > _knob_aperture * _knob_aperture);
+      }
 }
 
